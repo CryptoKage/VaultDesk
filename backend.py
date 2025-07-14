@@ -1,6 +1,10 @@
-import asyncio, json
+import asyncio
+import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from services.history_loader import load_eth_ohlc
+from services.vault import get_vault_status
+from services.price_aggregator import aggregate_prices, aggregate_all
 from services.hyperliquid import get_positions
 from strategies.ema_cross import EMAStrategy
 from config.settings import SETTINGS
@@ -8,50 +12,66 @@ from config.settings import SETTINGS
 app = FastAPI()
 connections: set[WebSocket] = set()
 
-# WebSocket endpoint for admin UI clients
+@app.get("/api/positions")
+async def api_positions():
+    try:
+        pos = get_positions()
+        return JSONResponse({"positions": pos})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/history")
+async def api_history(days: int = 60):
+    df = load_eth_ohlc(days=days)
+    return JSONResponse({"history": df.to_dict(orient="records")})
+
+@app.get("/api/vault")
+async def api_vault():
+    try:
+        vault = get_vault_status()
+        return JSONResponse({"vault": vault})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/prices")
+async def api_prices():
+    symbols = ["ethereum", "bitcoin"]
+    latest = {s: aggregate_prices(s) for s in symbols}
+    aggregated = await aggregate_all(symbols)
+    return {"latest": latest, "aggregated": aggregated}
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    print("⚡ New WS client connected:", ws.client)
     connections.add(ws)
     try:
-        pos = get_positions()
-        print("📤 Sent initial positions to client")
-        await ws.send_json({"type": "positions", "data": pos})
-
+        # Immediately send positions
+        await ws.send_json({"type": "positions", "data": get_positions()})
         while True:
             await asyncio.sleep(1)
-
     except WebSocketDisconnect:
-        print("🚪 WS client disconnected:", ws.client)
         connections.remove(ws)
 
-# Broadcast helper to relay messages to all connected clients
 async def broadcast(msg: dict):
-    dead = []
+    dead = set()
     for ws in connections:
         try:
             await ws.send_json(msg)
-        except Exception as e:
-            print("❌ Broadcast failed to a client:", e)
-            dead.append(ws)
-    for ws in dead:
-        print("🧹 Removing dead client:", ws.client)
-        connections.remove(ws)
+        except:
+            dead.add(ws)
+    connections.difference_update(dead)
 
-# HTML test page to verify WebSocket connectivity
+# Test HTML page
 html = """
 <!DOCTYPE html>
 <html><body>
 <script>
   const ws = new WebSocket("ws://localhost:8000/ws");
-  ws.onopen = () => console.log("✅ WS connected!");
-  ws.onerror = (e) => console.error("❌ WS error:", e);
-  ws.onclose = (e) => console.warn("⚠️ WS closed:", e);
+  ws.onopen = () => console.log("✅ WS connected");
   ws.onmessage = e => console.log("📡 WS update:", JSON.parse(e.data));
 </script>
-<h1>WebSocket Test</h1>
-<p>Check the browser console and terminal logs for debug info.</p>
+<h1>Trading Desk Admin</h1>
+<p>Check console for live updates from /ws.</p>
 </body></html>
 """
 
